@@ -21,7 +21,7 @@ pub(crate) struct ListenResult {
     pub max_pending_incoming_handshake_checks: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListenerMode {
     TcpOnly,
     UtpOnly,

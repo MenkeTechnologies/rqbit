@@ -133,6 +133,9 @@ pub struct Session {
     trackers: HashSet<url::Url>,
 
     lsd: Option<LocalServiceDiscovery>,
+    /// Peer exchange is off for this session (BEP 11). Read by the live torrent state when
+    /// it decides whether to gossip peers with a connection.
+    pub(crate) disable_pex: bool,
 
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
@@ -282,6 +285,12 @@ pub struct AddTorrentOptions {
 
     /// Max concurrent connected peers.
     pub peer_limit: Option<usize>,
+
+    /// The order files are fetched in, as file ids, most wanted first. Pieces are queued by
+    /// walking this list, so it is what makes "high priority" and "sequential" mean
+    /// something. When None, files are ordered by name (the historical default, which
+    /// exists because many torrents list files in an arbitrary order).
+    pub file_priorities: Option<Vec<usize>>,
 
     /// This is used to restore the session from serialized state.
     pub preferred_id: Option<usize>,
@@ -473,6 +482,11 @@ pub struct SessionOptions {
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
 
+    /// Disable peer exchange (BEP 11). PEX is on by default for public torrents; a user who
+    /// does not want their peer set gossiped turns it off here. Private torrents never
+    /// exchange peers regardless.
+    pub disable_pex: bool,
+
     /// Force IPv4 only.
     pub ipv4_only: bool,
 
@@ -505,6 +519,7 @@ impl Default for SessionOptions {
             #[cfg(feature = "disable-upload")]
             disable_upload: false,
             disable_local_service_discovery: false,
+            disable_pex: false,
             ipv4_only: false,
             client_name_and_version: None,
         }
@@ -812,6 +827,7 @@ impl Session {
                 blocklist,
                 allowlist,
                 lsd,
+                disable_pex: opts.disable_pex,
             });
 
             if let Some(mut listen) = listen_result {
@@ -1355,6 +1371,7 @@ impl Session {
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    file_priorities: opts.file_priorities.clone(),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },

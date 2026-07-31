@@ -128,7 +128,9 @@ pub(crate) struct TorrentStateLocked {
     pub(crate) pieces: Option<PieceTracker>,
 
     // The sorted file list in which order to download them.
-    file_priorities: FilePriorities,
+    /// The order files are fetched in. `pub(crate)` so the managed torrent can retarget a
+    /// running download (see `ManagedTorrent::update_file_priorities`).
+    pub(crate) file_priorities: FilePriorities,
 
     // If this is None, then it was already used
     fatal_errors_tx: Option<tokio::sync::oneshot::Sender<anyhow::Error>>,
@@ -235,18 +237,37 @@ impl TorrentStateLive {
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
 
-        // TODO: make it configurable
+        // The order pieces are queued in. An explicit order (from AddTorrentOptions, or set
+        // later through update_file_priorities) is what makes per-file priority and
+        // sequential download mean something; without one, files are ordered by name,
+        // because many torrents list them arbitrarily.
         let file_priorities = {
-            let mut pri = (0..paused.metadata.file_infos.len()).collect::<Vec<usize>>();
-            // sort by filename, cause many torrents have random sort order.
-            pri.sort_unstable_by_key(|id| {
-                paused
-                    .metadata
-                    .file_infos
-                    .get(*id)
-                    .map(|fi| fi.relative_filename.as_path())
-            });
-            pri
+            let file_count = paused.metadata.file_infos.len();
+            match paused.shared.options.file_priorities.as_ref() {
+                Some(explicit) => {
+                    let mut pri: Vec<usize> =
+                        explicit.iter().copied().filter(|id| *id < file_count).collect();
+                    // Anything the caller left out still has to be downloadable, so it goes
+                    // after what they named, in file order.
+                    for id in 0..file_count {
+                        if !pri.contains(&id) {
+                            pri.push(id);
+                        }
+                    }
+                    pri
+                }
+                None => {
+                    let mut pri = (0..file_count).collect::<Vec<usize>>();
+                    pri.sort_unstable_by_key(|id| {
+                        paused
+                            .metadata
+                            .file_infos
+                            .get(*id)
+                            .map(|fi| fi.relative_filename.as_path())
+                    });
+                    pri
+                }
+            }
         };
 
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
@@ -1176,7 +1197,19 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
         }
 
-        if !self.state.metadata.info.info().private && hs.m.ut_pex.is_some() {
+        // PEX is off for private torrents by definition, and off entirely when the session
+        // says so (SessionOptions::disable_pex).
+        let pex_disabled_for_session = self
+            .state
+            .shared
+            .session
+            .upgrade()
+            .map(|s| s.disable_pex)
+            .unwrap_or(false);
+        if !pex_disabled_for_session
+            && !self.state.metadata.info.info().private
+            && hs.m.ut_pex.is_some()
+        {
             spawn_with_cancel(
                 debug_span!(
                     parent: self.state.shared.span.clone(),

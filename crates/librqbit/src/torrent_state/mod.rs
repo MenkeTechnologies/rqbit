@@ -117,6 +117,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
+    /// Explicit file fetch order (file ids, most wanted first). See
+    /// `AddTorrentOptions::file_priorities`.
+    pub file_priorities: Option<Vec<usize>>,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }
@@ -500,6 +503,24 @@ impl ManagedTorrent {
     }
 
     /// Get stats.
+    /// Change the order files are fetched in, as file ids most-wanted-first. Takes effect
+    /// on the next piece the torrent queues, so a running download re-targets without a
+    /// restart. Ids that do not exist are ignored; files left out keep their relative order
+    /// after the ones named.
+    pub fn update_file_priorities(&self, order: Vec<usize>) -> anyhow::Result<()> {
+        let file_count = self.metadata.load().as_ref().map(|m| m.file_infos.len()).unwrap_or(0);
+        let mut pri: Vec<usize> = order.into_iter().filter(|id| *id < file_count).collect();
+        for id in 0..file_count {
+            if !pri.contains(&id) {
+                pri.push(id);
+            }
+        }
+        let live = self.live().context("torrent is not live")?;
+        let mut g = live.lock_write("update_file_priorities");
+        g.file_priorities = pri;
+        Ok(())
+    }
+
     pub fn stats(&self) -> TorrentStats {
         use stats::TorrentStatsState as S;
         let mut resp = TorrentStats {
