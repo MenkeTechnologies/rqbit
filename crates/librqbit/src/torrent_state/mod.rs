@@ -508,6 +508,23 @@ impl ManagedTorrent {
     /// Fetch these pieces before anything else, in this order. Takes effect on the next
     /// piece the torrent queues, so a running download re-primes without a restart; pass an
     /// empty list to clear the priority.
+    /// Change this torrent's own speed caps while it runs.
+    ///
+    /// The per-torrent limiter already exists (it is built from `AddTorrentOptions`); this
+    /// is what lets a caller move it afterwards, which is what a share-limit action, a
+    /// scheduler or a weighted split of the global cap all need.
+    pub fn set_ratelimits(&self, limits: crate::limits::LimitsConfig) -> anyhow::Result<()> {
+        let live = self.live().context("torrent is not live")?;
+        live.ratelimits.set_download_bps(limits.download_bps);
+        live.ratelimits.set_upload_bps(limits.upload_bps);
+        Ok(())
+    }
+
+    /// This torrent's current speed caps.
+    pub fn ratelimits(&self) -> Option<crate::limits::LimitsConfig> {
+        self.live().map(|live| live.ratelimits.get_config())
+    }
+
     pub fn update_priority_pieces(&self, pieces: Vec<u32>) -> anyhow::Result<()> {
         let live = self.live().context("torrent is not live")?;
         let mut g = live.lock_write("update_priority_pieces");
