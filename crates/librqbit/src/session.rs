@@ -284,6 +284,8 @@ pub struct AddTorrentOptions {
     /// Sub-folder within session's default output folder. Will error if "output_folder" if also set.
     /// By default, multi-torrent files are downloaded to a sub-folder.
     pub sub_folder: Option<String>,
+    /// Start this torrent in super-seeding mode (BEP 16).
+    pub super_seeding: bool,
     /// Override the name-folder decision. Applies on top of `output_folder`, which on its
     /// own means "put the files exactly here" and would otherwise drop the name folder a
     /// multi-file torrent asked for.
@@ -1349,7 +1351,13 @@ impl Session {
             opts.list_only,
         )?;
 
-        let layout = opts.content_layout.unwrap_or(ContentLayout::Original);
+        // Default per how the folder was chosen, so this stays source-compatible: passing
+        // `output_folder` has always meant "put the files exactly here", and a caller that
+        // wants the torrent's own name folder on top of it now says so explicitly.
+        let layout = opts.content_layout.unwrap_or(match opts.output_folder {
+            Some(_) => ContentLayout::NoSubfolder,
+            None => ContentLayout::Original,
+        });
         // The name folder the layout asks for, relative to whichever base folder wins below.
         let subfolder = match layout {
             ContentLayout::Original => self
@@ -1431,6 +1439,7 @@ impl Session {
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     file_priorities: opts.file_priorities.clone(),
                     priority_pieces: opts.priority_pieces.clone(),
+                    super_seeding: std::sync::atomic::AtomicBool::new(opts.super_seeding),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },

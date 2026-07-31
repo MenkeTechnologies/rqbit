@@ -122,6 +122,8 @@ pub(crate) struct ManagedTorrentOptions {
     pub file_priorities: Option<Vec<usize>>,
     /// Pieces to fetch before anything else. See `AddTorrentOptions::priority_pieces`.
     pub priority_pieces: Option<Vec<u32>>,
+    /// Super-seeding (BEP 16). Toggleable while the torrent runs, hence the atomic.
+    pub super_seeding: std::sync::atomic::AtomicBool,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }
@@ -523,6 +525,27 @@ impl ManagedTorrent {
     /// This torrent's current speed caps.
     pub fn ratelimits(&self) -> Option<crate::limits::LimitsConfig> {
         self.live().map(|live| live.ratelimits.get_config())
+    }
+
+    /// Turn super-seeding (BEP 16) on or off while the torrent runs.
+    ///
+    /// It only means anything on a torrent that is complete: the point is to stop a fresh
+    /// swarm's peers from all taking the same pieces from the only seed. Each peer is shown
+    /// exactly one piece at a time and is shown the next only once it has that one, which
+    /// makes it hand the piece on rather than sit on it.
+    pub fn set_super_seeding(&self, enabled: bool) {
+        self.shared
+            .options
+            .super_seeding
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Is super-seeding on?
+    pub fn super_seeding(&self) -> bool {
+        self.shared
+            .options
+            .super_seeding
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn update_priority_pieces(&self, pieces: Vec<u32>) -> anyhow::Result<()> {

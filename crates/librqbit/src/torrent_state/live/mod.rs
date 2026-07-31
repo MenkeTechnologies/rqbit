@@ -507,6 +507,8 @@ impl TorrentStateLive {
             tx,
             counters,
             first_message_received: AtomicBool::new(false),
+            superseed_piece: Mutex::new(None),
+            superseed_given: Mutex::new(Vec::new()),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
@@ -571,6 +573,8 @@ impl TorrentStateLive {
             tx,
             counters,
             first_message_received: AtomicBool::new(false),
+            superseed_piece: Mutex::new(None),
+            superseed_given: Mutex::new(Vec::new()),
             cancel_token: state.cancellation_token.child_token(),
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
         };
@@ -1057,6 +1061,17 @@ struct PeerHandler {
 
     first_message_received: AtomicBool,
 
+    /// Under super-seeding (BEP 16), the one piece this peer has been shown, and how much of
+    /// it we have served. It is replaced only once the peer has the piece — either because it
+    /// announced it, or because we finished sending it — which is the whole mechanism: a peer
+    /// gets one piece at a time and has to come back for the next.
+    superseed_piece: Mutex<Option<(ValidPieceIndex, u32)>>,
+
+    /// Pieces already shown to this peer, so it is never pointed at the same one twice. The
+    /// peer's own bitfield cannot answer this: a peer that suppresses a HAVE for a piece it
+    /// thinks we hold never tells us it took ours.
+    superseed_given: Mutex<Vec<u32>>,
+
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
@@ -1157,6 +1172,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
     fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()> {
         self.state.set_peer_live(self.addr, handshake, ckind);
+        // Under super-seeding the first HAVE has to be unprompted. A peer only becomes
+        // interested once it believes we hold something it wants, and we have just told it
+        // we hold nothing — so waiting for interest here would deadlock the connection.
+        self.offer_superseed_piece();
         Ok(())
     }
 
@@ -1252,12 +1271,23 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         if self.state.torrent().options.disable_upload() {
             return false;
         }
+        // A super-seed claims nothing up front: BEP 16's whole effect comes from the peer
+        // believing this seed holds one piece, so it asks for that one and then passes it on
+        // to earn the next. Sending the real bitfield would give the game away immediately.
+        if self.superseeding() {
+            return false;
+        }
 
         self.state.get_approx_have_bytes() > 0
     }
 
     fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
         if self.state.shared.options.disable_upload() {
+            return false;
+        }
+        // Under super-seeding the HAVEs this peer sees are chosen for it, one at a time, by
+        // `offer_superseed_piece`; the torrent-wide broadcast must not leak the rest.
+        if self.superseeding() {
             return false;
         }
         let have = self
@@ -1290,6 +1320,112 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 }
 
 impl PeerHandler {
+    /// Is this torrent super-seeding right now?
+    fn superseeding(&self) -> bool {
+        self.state
+            .shared
+            .options
+            .super_seeding
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Show this peer one more piece, if super-seeding says it has earned one.
+    ///
+    /// The piece is one the peer does not already have; among those, the one that has been
+    /// handed out to the fewest peers so far, which is what stops every peer being pointed
+    /// at piece 0. Nothing is sent when the peer still owes us the last piece we showed it.
+    fn offer_superseed_piece(&self) {
+        if !self.superseeding() {
+            return;
+        }
+        let mut current = self.superseed_piece.lock();
+        if current.is_some() {
+            // Still working on the one it has; BEP 16 says it earns the next by taking this
+            // one, not by asking for more.
+            return;
+        }
+        let have = self
+            .state
+            .peers
+            .with_live(self.addr, |l| l.bitfield.clone())
+            .unwrap_or_else(|| make_piece_bitfield(&self.state.lengths));
+        // How many peers have each piece, so the rarest goes out first.
+        let mut spread = vec![0usize; self.state.lengths.total_pieces() as usize];
+        self.state.peers.states.iter().for_each(|p| {
+            if let PeerState::Live(l) = p.value().get_state() {
+                for (i, bit) in l.bitfield.iter().enumerate() {
+                    if *bit && i < spread.len() {
+                        spread[i] += 1;
+                    }
+                }
+            }
+        });
+        // Only pieces this seed actually holds are on offer.
+        let ours: Vec<bool> = {
+            let g = self.state.lock_read("superseed_have_pieces");
+            match g.get_chunks() {
+                Ok(chunks) => chunks.get_have_pieces().as_slice().iter().map(|b| *b).collect(),
+                Err(_) => return,
+            }
+        };
+        let given = self.superseed_given.lock().clone();
+        let choice = (0..self.state.lengths.total_pieces())
+            .filter(|id| ours.get(*id as usize).copied().unwrap_or(false))
+            .filter(|id| !have.get(*id as usize).map(|b| *b).unwrap_or(false))
+            .filter(|id| !given.contains(id))
+            .min_by_key(|id| spread[*id as usize]);
+        let Some(choice) = choice.and_then(|id| self.state.lengths.validate_piece_index(id)) else {
+            return;
+        };
+        *current = Some((choice, 0));
+        drop(current);
+        self.superseed_given.lock().push(choice.get());
+        // Straight at this peer's writer rather than the torrent-wide broadcast: under
+        // super-seeding every peer is told something different.
+        let _ = self.tx.send(WriterRequest::Message(Message::Have(choice.get())));
+        trace!(piece = choice.get(), addr = ?self.addr, "super-seed: offered a piece");
+    }
+
+    /// The peer announced it holds `have`. If that is the piece we showed it, it has done
+    /// what super-seeding asks and is entitled to the next one.
+    fn superseed_on_peer_have(&self, have: u32) {
+        if !self.superseeding() {
+            return;
+        }
+        let mut current = self.superseed_piece.lock();
+        if current.map(|(p, _)| p.get()) == Some(have) {
+            *current = None;
+            drop(current);
+            self.offer_superseed_piece();
+        }
+    }
+
+    /// Count what we have served of the offered piece, and move on once the peer holds all
+    /// of it.
+    ///
+    /// BEP 16's letter is "do not offer another until the peer has passed this one on", but
+    /// a peer that suppresses a HAVE for a piece it believes we already hold — which is a
+    /// normal optimisation, and what this very client does — would never tell us, and the
+    /// swarm would stall on one piece forever. Counting the bytes we sent answers the same
+    /// question without needing the peer's cooperation.
+    fn superseed_on_uploaded(&self, piece: ValidPieceIndex, length: u32) {
+        if !self.superseeding() {
+            return;
+        }
+        let mut current = self.superseed_piece.lock();
+        let Some((offered, served)) = current.as_mut() else { return };
+        if *offered != piece {
+            return;
+        }
+        *served += length;
+        if *served < self.state.lengths.piece_length(piece) {
+            return;
+        }
+        *current = None;
+        drop(current);
+        self.offer_superseed_piece();
+    }
+
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
         let peers = &self.state.peers;
         let handle = self.addr;
@@ -1566,10 +1702,12 @@ impl PeerHandler {
         self.state
             .ratelimit_upload_tx
             .send((self.tx.clone(), chunk_info))?;
+        self.superseed_on_uploaded(piece_index, request.length);
         Ok(())
     }
 
     fn on_have(&self, have: u32) {
+        self.superseed_on_peer_have(have);
         self.state
             .peers
             .with_live_mut(self.addr, "on_have", |live| {
@@ -1601,6 +1739,10 @@ impl PeerHandler {
                 }
             });
         self.on_bitfield_notify.notify_waiters();
+        // A piece we did not have a source for a moment ago now has one. Without this the
+        // requester sits out its five-second poll before noticing, which under super-seeding
+        // means the whole torrent arrives one piece per five seconds.
+        self.state.new_pieces_notify.notify_waiters();
     }
 
     fn on_bitfield(&self, bitfield: ByteBufOwned) -> anyhow::Result<()> {
@@ -1620,6 +1762,8 @@ impl PeerHandler {
         }
         self.state.peers.update_bitfield(self.addr, bf);
         self.on_bitfield_notify.notify_waiters();
+        // Now that we know what it has, we know what to show it.
+        self.offer_superseed_piece();
         Ok(())
     }
 
@@ -1802,6 +1946,7 @@ impl PeerHandler {
     fn on_peer_interested(&self) {
         trace!("peer is interested");
         self.state.peers.mark_peer_interested(self.addr, true);
+        self.offer_superseed_piece();
     }
 
     fn on_i_am_unchoked(&self) {
