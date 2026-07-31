@@ -120,6 +120,8 @@ pub(crate) struct ManagedTorrentOptions {
     /// Explicit file fetch order (file ids, most wanted first). See
     /// `AddTorrentOptions::file_priorities`.
     pub file_priorities: Option<Vec<usize>>,
+    /// Pieces to fetch before anything else. See `AddTorrentOptions::priority_pieces`.
+    pub priority_pieces: Option<Vec<u32>>,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }
@@ -503,6 +505,16 @@ impl ManagedTorrent {
     }
 
     /// Get stats.
+    /// Fetch these pieces before anything else, in this order. Takes effect on the next
+    /// piece the torrent queues, so a running download re-primes without a restart; pass an
+    /// empty list to clear the priority.
+    pub fn update_priority_pieces(&self, pieces: Vec<u32>) -> anyhow::Result<()> {
+        let live = self.live().context("torrent is not live")?;
+        let mut g = live.lock_write("update_priority_pieces");
+        g.priority_pieces = pieces;
+        Ok(())
+    }
+
     /// Change the order files are fetched in, as file ids most-wanted-first. Takes effect
     /// on the next piece the torrent queues, so a running download re-targets without a
     /// restart. Ids that do not exist are ignored; files left out keep their relative order

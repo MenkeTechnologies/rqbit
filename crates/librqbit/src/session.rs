@@ -243,6 +243,22 @@ fn merge_two_optional_streams<T>(
 /// Options for adding new torrents to the session.
 //
 // Serialize/deserialize is for Tauri.
+/// Where a torrent's files land under the output folder.
+///
+/// The BitTorrent metainfo already answers this — a multi-file torrent names a directory,
+/// a single-file one names the file — but every mainline client lets the user override it,
+/// because "one loose file per season pack" and "a folder holding one .iso" are both things
+/// people organise around. `Original` is what the torrent asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentLayout {
+    /// Honour the torrent: a name folder for multi-file, nothing for single-file.
+    Original,
+    /// Always create the name folder, single-file torrents included.
+    Subfolder,
+    /// Never create it — every file lands directly in the output folder.
+    NoSubfolder,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct AddTorrentOptions {
     /// Start in paused state.
@@ -268,6 +284,10 @@ pub struct AddTorrentOptions {
     /// Sub-folder within session's default output folder. Will error if "output_folder" if also set.
     /// By default, multi-torrent files are downloaded to a sub-folder.
     pub sub_folder: Option<String>,
+    /// Override the name-folder decision. Applies on top of `output_folder`, which on its
+    /// own means "put the files exactly here" and would otherwise drop the name folder a
+    /// multi-file torrent asked for.
+    pub content_layout: Option<ContentLayout>,
     /// Peer connection options, timeouts etc. If not set, session's defaults will be used.
     pub peer_opts: Option<PeerConnectionOptions>,
 
@@ -285,6 +305,10 @@ pub struct AddTorrentOptions {
 
     /// Max concurrent connected peers.
     pub peer_limit: Option<usize>,
+
+    /// Pieces to fetch before anything else, in this order — "first and last piece first",
+    /// the primer that lets a media player start reading while the rest arrives.
+    pub priority_pieces: Option<Vec<u32>>,
 
     /// The order files are fetched in, as file ids, most wanted first. Pieces are queued by
     /// walking this list, so it is what makes "high priority" and "sequential" mean
@@ -1231,6 +1255,32 @@ impl Session {
         Ok::<_, anyhow::Error>(Some(PathBuf::from(longest)))
     }
 
+    /// The name folder for [`ContentLayout::Subfolder`]: the same name the default rule
+    /// would pick, except that a single-file torrent gets one too.
+    fn forced_subfolder_for_torrent(
+        &self,
+        info: &ValidatedTorrentMetaV1Info<ByteBufOwned>,
+        magnet_name: Option<&str>,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        if let Some(folder) = self.get_default_subfolder_for_torrent(info, magnet_name)? {
+            return Ok(Some(folder));
+        }
+        // Single-file: the torrent's name is the file's name, so the folder takes the stem —
+        // `debian.iso` must not become `debian.iso/debian.iso`.
+        let name = info
+            .name()
+            .map(|n| n.to_string())
+            .or_else(|| magnet_name.map(str::to_string))
+            .context("torrent has no name to make a folder from")?;
+        let pb = PathBuf::from(&name);
+        if pb.components().any(|c| !matches!(c, Component::Normal(_))) {
+            bail!("path traversal in torrent name detected")
+        }
+        Ok(Some(PathBuf::from(
+            pb.file_stem().map(|s| s.to_owned()).unwrap_or_else(|| name.into()),
+        )))
+    }
+
     async fn add_torrent_internal(
         self: &Arc<Self>,
         add_res: InternalAddResult,
@@ -1299,12 +1349,20 @@ impl Session {
             opts.list_only,
         )?;
 
+        let layout = opts.content_layout.unwrap_or(ContentLayout::Original);
+        // The name folder the layout asks for, relative to whichever base folder wins below.
+        let subfolder = match layout {
+            ContentLayout::Original => self
+                .get_default_subfolder_for_torrent(&metadata.info, name.as_deref())?
+                .unwrap_or_default(),
+            ContentLayout::Subfolder => self
+                .forced_subfolder_for_torrent(&metadata.info, name.as_deref())?
+                .unwrap_or_default(),
+            ContentLayout::NoSubfolder => PathBuf::new(),
+        };
         let output_folder = match (opts.output_folder, opts.sub_folder) {
-            (None, None) => self.output_folder.join(
-                self.get_default_subfolder_for_torrent(&metadata.info, name.as_deref())?
-                    .unwrap_or_default(),
-            ),
-            (Some(o), None) => PathBuf::from(o),
+            (None, None) => self.output_folder.join(subfolder),
+            (Some(o), None) => PathBuf::from(o).join(subfolder),
             (Some(_), Some(_)) => {
                 bail!("you can't provide both output_folder and sub_folder")
             }
@@ -1372,6 +1430,7 @@ impl Session {
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     file_priorities: opts.file_priorities.clone(),
+                    priority_pieces: opts.priority_pieces.clone(),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },

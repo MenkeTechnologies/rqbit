@@ -132,6 +132,11 @@ pub(crate) struct TorrentStateLocked {
     /// running download (see `ManagedTorrent::update_file_priorities`).
     pub(crate) file_priorities: FilePriorities,
 
+    /// Pieces to fetch before anything else, in this order — what "download the first and
+    /// last pieces first" means, and what lets a player start reading a container while the
+    /// middle is still arriving. Empty for an ordinary download.
+    pub(crate) priority_pieces: Vec<u32>,
+
     // If this is None, then it was already used
     fatal_errors_tx: Option<tokio::sync::oneshot::Sender<anyhow::Error>>,
 
@@ -290,6 +295,7 @@ impl TorrentStateLive {
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 file_priorities,
+                priority_pieces: paused.shared.options.priority_pieces.clone().unwrap_or_default(),
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
             }),
@@ -1464,13 +1470,23 @@ impl PeerHandler {
                 let TorrentStateLocked {
                     pieces,
                     file_priorities,
+                    priority_pieces,
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
+                // Explicitly prioritised pieces (first/last of each file, set by the client)
+                // go ahead of the open streams' look-ahead, which in turn goes ahead of the
+                // ordinary queue.
+                let explicit: Vec<_> = priority_pieces
+                    .iter()
+                    .filter_map(|id| self.state.lengths.validate_piece_index(*id))
+                    .collect();
                 let result = pieces.acquire_piece(AcquireRequest {
                     peer: self.addr,
                     peer_avg_time: self.counters.average_piece_download_time(),
-                    priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
+                    priority_pieces: explicit
+                        .into_iter()
+                        .chain(self.state.streams.iter_next_pieces(&self.state.lengths)),
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
                     peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
